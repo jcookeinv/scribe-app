@@ -1,7 +1,7 @@
 (function(){
 'use strict';
 
-var APP_VERSION = 'scribe-v1';
+var APP_VERSION = 'scribe-v3';
 var RATE = 16000;
 var LIVE_MIN = 12 * RATE;       // live slices are cut at a quiet point between 12 and 18 seconds
 var LIVE_MAX = 18 * RATE;
@@ -85,13 +85,20 @@ function sheet(title, body, buttons){
 
 /* ---------- settings ---------- */
 var Settings = {
-  data: { model: 'base', keepAudio: true },
+  data: { model: 'base', keepAudio: true, speakers: true },
   load: function(){
-    try { var s = JSON.parse(localStorage.getItem('scribe.settings') || '{}'); if (s.model && MODELS[s.model]) this.data.model = s.model; if (typeof s.keepAudio === 'boolean') this.data.keepAudio = s.keepAudio; } catch (e) {}
+    try {
+      var s = JSON.parse(localStorage.getItem('scribe.settings') || '{}');
+      if (s.model && MODELS[s.model]) this.data.model = s.model;
+      if (typeof s.keepAudio === 'boolean') this.data.keepAudio = s.keepAudio;
+      if (typeof s.speakers === 'boolean') this.data.speakers = s.speakers;
+    } catch (e) {}
   },
   save: function(){ try { localStorage.setItem('scribe.settings', JSON.stringify(this.data)); } catch (e) {} }
 };
 function modelReady(k){ try { return localStorage.getItem('scribe.ready.' + k) === '1'; } catch (e) { return false; } }
+function voiceReady(){ return modelReady('voice'); }
+var VOICE_SIZE = 'about 7 MB';
 
 /* ---------- storage (IndexedDB) ---------- */
 var DB = (function(){
@@ -148,12 +155,15 @@ var DB = (function(){
 var Engine = (function(){
   var worker = null, readyKey = null, loadingKey = null, loadPromise = null;
   var initRes = null, initRej = null, nextId = 1, runs = {};
+  var voiceState = 'none', voicePromise = null, voiceRes = null;   // none, loading, ready, failed
   var hooks = { download: null, status: null };
   function handle(e){
     var m = e.data;
     if (m.type === 'download'){ if (hooks.download) hooks.download(m.loaded, m.total); }
     else if (m.type === 'status'){ if (hooks.status) hooks.status(m.text); }
     else if (m.type === 'ready'){ if (initRes) initRes(); }
+    else if (m.type === 'voiceready'){ voiceState = 'ready'; try { localStorage.setItem('scribe.ready.voice', '1'); } catch (e2) {} if (voiceRes) voiceRes(true); }
+    else if (m.type === 'voicefail'){ voiceState = 'failed'; voicePromise = null; if (voiceRes) voiceRes(false); }
     else if (m.type === 'result'){ var r = runs[m.id]; if (r){ delete runs[m.id]; r.resolve(m); } }
     else if (m.type === 'error'){
       if (m.id != null && runs[m.id]){ var q = runs[m.id]; delete runs[m.id]; q.reject(new Error(m.message)); }
@@ -168,11 +178,30 @@ var Engine = (function(){
       var err = new Error('The transcription engine failed to start' + (e && e.message ? ': ' + e.message : ''));
       if (initRej) initRej(err);
       Object.keys(runs).forEach(function(k){ runs[k].reject(err); delete runs[k]; });
-      worker = null; readyKey = null; loadingKey = null; loadPromise = null;
+      worker = null; readyKey = null; loadingKey = null; loadPromise = null; voiceState = 'none'; voicePromise = null;
     };
   }
   return {
     hooks: hooks,
+    voiceState: function(){ return voiceState; },
+    // Resolves true when speaker fingerprints are available, false if they are not (never rejects).
+    ensureVoice: function(){
+      if (voiceState === 'ready') return Promise.resolve(true);
+      if (voiceState === 'failed') return Promise.resolve(false);
+      if (voicePromise) return voicePromise;
+      spawn();
+      voiceState = 'loading';
+      voicePromise = new Promise(function(res){ voiceRes = res; });
+      worker.postMessage({ type: 'initvoice', tfUrl: abs('vendor/transformers.min.js'), ortBase: abs('vendor/') });
+      return voicePromise;
+    },
+    embed: function(pieces){
+      return new Promise(function(resolve, reject){
+        var id = nextId++;
+        runs[id] = { resolve: resolve, reject: reject };
+        worker.postMessage({ type: 'embed', id: id, pieces: pieces }, pieces.map(function(p){ return p.buffer; }));
+      });
+    },
     isReady: function(k){ return readyKey === k; },
     isLoading: function(){ return !!loadingKey && readyKey !== loadingKey; },
     ensure: function(key){
@@ -187,15 +216,17 @@ var Engine = (function(){
       worker.postMessage({ type: 'init', model: MODELS[key].id, tfUrl: abs('vendor/transformers.min.js'), ortBase: abs('vendor/') });
       return loadPromise;
     },
-    run: function(samples){
+    run: function(samples, voice){
       return new Promise(function(resolve, reject){
         var id = nextId++;
         runs[id] = { resolve: resolve, reject: reject };
-        worker.postMessage({ type: 'run', id: id, audio: samples }, [samples.buffer]);
+        worker.postMessage({ type: 'run', id: id, audio: samples, voice: !!voice }, [samples.buffer]);
       });
     }
   };
 })();
+
+var voiceWarned = false;
 
 /* serial queue of audio slices to transcribe */
 var Queue = (function(){
@@ -217,14 +248,21 @@ var Queue = (function(){
     if (rms(j.samples) < SILENCE_RMS) return [];
     var key = Settings.data.model;
     await Engine.ensure(key);
-    var r = await Engine.run(j.samples);
+    var voice = Settings.data.speakers ? await Engine.ensureVoice() : false;
+    if (Settings.data.speakers && !voice && !voiceWarned){
+      voiceWarned = true;
+      toast('Speaker recognition needs a one-time download of the voice model. Connect to the internet once to set it up. Transcribing continues without it.', 7000);
+    }
+    var r = await Engine.run(j.samples, voice);
     var segs = [];
     (r.chunks || []).forEach(function(c){
       var t = clean(c.text);
       if (!t || NOISE_TAG.test(t)) return;
       var s = j.start + (c.start == null ? 0 : c.start);
       var e = j.start + (c.end == null ? dur : c.end);
-      segs.push({ s: s, e: Math.max(e, s), t: t });
+      var sg = { s: s, e: Math.max(e, s), t: t };
+      if (c.emb){ sg.emb = c.emb; sg.ed = c.ed; }
+      segs.push(sg);
     });
     return segs;
   }
@@ -320,11 +358,19 @@ async function startRecording(){
   var ctx = new AC();
   try { ctx.resume(); } catch (e) {}
   var key = Settings.data.model;
-  if (!modelReady(key)){
-    var go = await sheet('Download the ' + MODELS[key].label + ' model?',
-      'First use needs a one-time download (' + MODELS[key].size + '). Wi-Fi is best. You can record straight away and captions will catch up once it has downloaded.',
-      [{ label: 'Download and record', primary: true, value: true }, { label: 'Cancel', value: false }]);
+  var needText = !modelReady(key), needVoice = Settings.data.speakers && !voiceReady();
+  if (needText || needVoice){
+    var parts = [];
+    if (needText) parts.push(MODELS[key].size + ' for the ' + MODELS[key].label + ' transcription model');
+    if (needVoice) parts.push(VOICE_SIZE + ' for telling voices apart');
+    var btns = [{ label: 'Download and record', primary: true, value: 'dl' }];
+    if (!needText) btns.push({ label: 'Record without speaker names', value: 'skip' });
+    btns.push({ label: 'Cancel', value: false });
+    var go = await sheet(needText ? 'Download the ' + MODELS[key].label + ' model?' : 'Download the voice model?',
+      'First use needs a one-time download: ' + parts.join(' and ') + '. Wi-Fi is best. You can record straight away and captions will catch up once it has downloaded.',
+      btns);
     if (!go){ ctx.close(); return; }
+    if (go === 'skip'){ Settings.data.speakers = false; Settings.save(); toast('Speaker recognition is off. Turn it back on in Settings.', 5000); }
   }
   var stream;
   try {
@@ -378,6 +424,7 @@ async function startRecording(){
   setStatus('Recording', true);
   Rec.timer = setInterval(tick, 250);
   Engine.ensure(key).catch(function(err){ toast('Captions are paused: ' + friendlyError(err), 6000); updateEngineLine(); });
+  if (Settings.data.speakers) Engine.ensureVoice();
   updateEngineLine();
 }
 
@@ -411,7 +458,9 @@ function dispatchSlice(final){
   var session = Rec;
   var p = Queue.add(slice, start).then(function(segs){
     if (!segs.length) return;
-    segs.forEach(function(sg){ session.rec.segments.push(sg); addLiveLine(sg); });
+    segs.forEach(function(sg){ session.rec.segments.push(sg); });
+    labelSpeakers(session.rec);
+    renderLive();
     session.rec.duration = session.total / RATE;
     DB.putRec(session.rec).catch(function(){});
   }).catch(function(err){
@@ -421,14 +470,52 @@ function dispatchSlice(final){
   Rec.jobs.push(p);
 }
 
-function addLiveLine(sg){
-  var box = $('live');
+/* ---------- speakers and paragraphs ---------- */
+function speakerName(rec, i){ return (rec.names && rec.names[i]) || ('Speaker ' + (i + 1)); }
+function showSpeakers(rec){ return (rec.spkK || 0) > 1; }
+function hasPrints(rec){ return rec.segments.some(function(s){ return !!s.emb; }); }
+// Works out who said each sentence from the stored voice fingerprints.
+function labelSpeakers(rec, count){
+  var segs = rec.segments;
+  if (count !== undefined) rec.spkCount = count;
+  if (!hasPrints(rec)){ segs.forEach(function(s){ delete s.spk; }); rec.spkK = 0; return; }
+  var r = Spk.cluster(segs, { count: rec.spkCount || 0 });
+  for (var i = 0; i < segs.length; i++) segs[i].spk = r.labels[i];
+  rec.spkK = r.k;
+}
+function parasOf(rec){ return Spk.paragraphs(rec.segments, { gap: (rec.spkK || 0) > 0 ? 6 : 2.5 }); }
+function paraText(rec, p){
+  var out = [];
+  p.idx.forEach(function(i){ var t = rec.segments[i].t; if (t) out.push(t); });
+  return out.join(' ');
+}
+function rowsOf(rec){
+  var rows = parasOf(rec).filter(function(p){ return paraText(rec, p); }).map(function(p){ return { kind: 'para', t: p.s, p: p }; })
+    .concat((rec.flags || []).map(function(f){ return { kind: 'flag', t: f }; }));
+  rows.sort(function(a, b){ return a.t - b.t; });
+  return rows;
+}
+
+function renderLive(){
+  if (!Rec) return;
+  var rec = Rec.rec, box = $('live');
+  var prevTop = box.scrollTop;
   var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-  var row = el('div', 'line');
-  row.appendChild(el('div', 'ts', clock(sg.s)));
-  row.appendChild(el('div', 'tx', sg.t));
-  box.appendChild(row);
-  if (nearBottom) box.scrollTop = box.scrollHeight;
+  box.textContent = '';
+  var labelled = showSpeakers(rec);
+  rowsOf(rec).forEach(function(r){
+    if (r.kind === 'flag'){
+      var f = el('div', 'flag'); f.appendChild(el('span', '', 'Flagged at ' + clock(r.t))); box.appendChild(f); return;
+    }
+    var row = el('div', 'line');
+    row.appendChild(el('div', 'ts', clock(r.p.s)));
+    var body = el('div', 'body');
+    if (labelled) body.appendChild(el('div', 'who sp' + (r.p.spk % 6), speakerName(rec, r.p.spk)));
+    body.appendChild(el('div', 'tx', paraText(rec, r.p)));
+    row.appendChild(body);
+    box.appendChild(row);
+  });
+  box.scrollTop = nearBottom ? box.scrollHeight : prevTop;
 }
 
 function tick(){
@@ -487,6 +574,7 @@ async function stopRecording(){
   clearInterval(waiting);
 
   var rec = S.rec;
+  labelSpeakers(rec);
   var failed = S.errors > 0;
   if (rec.hasAudio){
     var chunks = await DB.getChunks(rec.id);
@@ -519,10 +607,7 @@ $('flagBtn').addEventListener('click', function(){
   var t = Rec.total / RATE;
   Rec.rec.flags.push(t);
   DB.putRec(Rec.rec).catch(function(){});
-  var row = el('div', 'flag');
-  row.appendChild(el('span', '', 'Flagged at ' + clock(t)));
-  $('live').appendChild(row);
-  $('live').scrollTop = $('live').scrollHeight;
+  renderLive();
   if (navigator.vibrate) navigator.vibrate(30);
 });
 
@@ -607,6 +692,8 @@ async function runTranscription(rec, blob){
       $('dProgText').textContent = 'Transcribing with the ' + MODELS[key].label + ' model: ' + Math.round(f * 100) + '%';
     });
     rec.segments = res.segments;
+    rec.names = {}; rec.spkCount = 0;
+    labelSpeakers(rec);
     rec.duration = rec.duration || res.duration;
     rec.status = 'done';
     rec.notes = rec.notes.filter(function(n){ return !/Re-transcribe/.test(n); });
@@ -663,7 +750,7 @@ async function renderLibrary(){
     if (r.status === 'transcribing') t.appendChild(el('span', 'tag', 'Transcribing'));
     if (r.status === 'recording') t.appendChild(el('span', 'tag', 'Unfinished'));
     b.appendChild(t);
-    b.appendChild(el('div', 'm', dateLabel(r.createdAt) + ', ' + clock(r.duration)));
+    b.appendChild(el('div', 'm', dateLabel(r.createdAt) + ', ' + clock(r.duration) + (r.spkK > 1 ? ', ' + r.spkK + ' speakers' : '')));
     if (r.segments.length) b.appendChild(el('div', 'snip', r.segments.slice(0, 3).map(function(s){ return s.t; }).join(' ')));
     b.addEventListener('click', function(){ openDetail(r.id); });
     box.appendChild(b);
@@ -673,12 +760,12 @@ async function renderLibrary(){
 $('libSearch').addEventListener('input', renderLibrary);
 
 /* ---------- detail ---------- */
-var current = null, editing = false, audioUrl = null;
+var current = null, editing = false, audioUrl = null, notesView = false;
 
 async function openDetail(id){
   var rec = await DB.getRec(id);
   if (!rec) return;
-  current = rec; editing = false;
+  current = rec; editing = false; notesView = false;
   if (audioUrl){ URL.revokeObjectURL(audioUrl); audioUrl = null; }
   var player = $('player');
   player.removeAttribute('src');
@@ -702,22 +789,27 @@ function renderDetail(rec){
   var acts = $('dActions');
   acts.innerHTML = '';
   function chip(label, fn, cls){ var b = el('button', 'chip' + (cls ? ' ' + cls : ''), label); b.addEventListener('click', fn); acts.appendChild(b); return b; }
-  chip('Copy', function(){ copyText(plainText(rec)); });
+  var canNotes = !busy && rec.segments.some(function(x){ return x.t; });
+  if (!canNotes) notesView = false;
+  $('dSearch').hidden = notesView;
+  if (canNotes) chip(notesView ? 'Transcript' : 'Meeting notes', function(){ notesView = !notesView; editing = false; renderDetail(rec); $('dScroll').scrollTop = 0; }, notesView ? '' : 'primary');
+  chip('Copy', function(){ copyText(notesView ? notesText(rec) : plainText(rec)); });
   chip('Share', function(){ shareRec(rec); });
   chip('Export', function(){ exportSheet(rec); });
-  chip(editing ? 'Done' : 'Edit', function(){ editing = !editing; renderDetail(rec); });
+  if (!notesView) chip(editing ? 'Done' : 'Edit', function(){ editing = !editing; renderDetail(rec); });
+  if (!busy && hasPrints(rec)) chip('Speakers', function(){ speakersMenu(rec); });
+  else if (!busy && rec.hasAudio && rec.segments.length && Settings.data.speakers) chip('Find speakers', function(){ findSpeakers(rec); });
   if (rec.hasAudio && !busy) chip('Re-transcribe', function(){ retranscribe(rec); });
   chip('Delete', function(){ removeRec(rec); }, 'danger');
   renderSegments(rec);
 }
 
 function renderSegments(rec){
+  if (notesView){ renderNotes(rec); return; }
   var q = $('dSearch').value.trim();
   var box = $('dSegs');
   box.innerHTML = '';
-  var rows = rec.segments.map(function(s, i){ return { kind: 'seg', t: s.s, seg: s, i: i }; })
-    .concat((rec.flags || []).map(function(f){ return { kind: 'flag', t: f }; }));
-  rows.sort(function(a, b){ return a.t - b.t; });
+  var rows = rowsOf(rec), segs = rec.segments, labelled = showSpeakers(rec);
   rec.notes.forEach(function(n){ box.appendChild(el('div', 'banner', n)); });
   if (!rows.length){
     box.appendChild(el('div', 'empty', rec.status === 'transcribing' ? 'Working on it. The transcript will appear here when it is ready.' : 'No transcript yet.'));
@@ -725,6 +817,12 @@ function renderSegments(rec){
   }
   var re = null;
   if (q){ re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig'); }
+  function fill(node, text){
+    if (!re){ node.textContent = text; return; }
+    text.split(re).forEach(function(part, idx){
+      if (idx % 2 === 1) node.appendChild(el('mark', '', part)); else node.appendChild(document.createTextNode(part));
+    });
+  }
   rows.forEach(function(r){
     if (r.kind === 'flag'){
       var f = el('div', 'flag');
@@ -732,25 +830,142 @@ function renderSegments(rec){
       fb.addEventListener('click', function(){ seekTo(r.t); });
       f.appendChild(fb); box.appendChild(f); return;
     }
-    if (q && r.seg.t.toLowerCase().indexOf(q.toLowerCase()) < 0) return;
-    var row = el('div', 'seg'); row.dataset.s = r.seg.s; row.dataset.e = r.seg.e;
-    var ts = el('button', 'ts', clock(r.seg.s));
-    ts.addEventListener('click', function(){ seekTo(r.seg.s); });
+    var p = r.p, objs = p.idx.map(function(i){ return segs[i]; });
+    var whole = paraText(rec, p);
+    if (q && whole.toLowerCase().indexOf(q.toLowerCase()) < 0) return;
+    var row = el('div', 'seg'); row.dataset.s = p.s; row.dataset.e = p.e;
+    var ts = el('button', 'ts', clock(p.s));
+    ts.addEventListener('click', function(){ seekTo(p.s); });
+    var body = el('div', 'body');
+    if (labelled){
+      var who = el('button', 'who sp' + (p.spk % 6), speakerName(rec, p.spk));
+      who.setAttribute('aria-label', 'Speaker: ' + speakerName(rec, p.spk) + '. Tap to change.');
+      who.addEventListener('click', function(){ pickSpeaker(rec, objs); });
+      body.appendChild(who);
+    }
     var tx = el('div', 'tx');
-    if (re){
-      r.seg.t.split(re).forEach(function(part, idx){
-        if (idx % 2 === 1){ var m = el('mark', '', part); tx.appendChild(m); } else tx.appendChild(document.createTextNode(part));
-      });
-    } else tx.textContent = r.seg.t;
     if (editing){
+      tx.textContent = whole;
       tx.contentEditable = 'true';
       tx.addEventListener('blur', function(){
         var v = tx.textContent.replace(/\s+/g, ' ').trim();
-        if (v && v !== r.seg.t){ r.seg.t = v; DB.putRec(rec); }
+        if (v && v !== whole){
+          // the edited text lives in the first sentence of the paragraph; the rest keep their timing and voice but show no text
+          var firstIdx = -1;
+          objs.forEach(function(o, k){ if (firstIdx < 0 && o.t) firstIdx = k; });
+          if (firstIdx < 0) firstIdx = 0;
+          objs.forEach(function(o, k){ o.t = k === firstIdx ? v : ''; });
+          whole = v;
+          DB.putRec(rec);
+        }
+      });
+    } else {
+      objs.forEach(function(o){
+        if (!o.t) return;
+        var sn = el('span', 'sn'); sn.dataset.s = o.s; sn.dataset.e = o.e;
+        fill(sn, o.t);
+        sn.addEventListener('click', function(){ seekTo(o.s); });
+        tx.appendChild(sn); tx.appendChild(document.createTextNode(' '));
       });
     }
-    row.appendChild(ts); row.appendChild(tx); box.appendChild(row);
+    body.appendChild(tx);
+    row.appendChild(ts); row.appendChild(body); box.appendChild(row);
   });
+}
+
+/* change who said a paragraph */
+async function pickSpeaker(rec, objs){
+  var cur = objs[0].spk, buttons = [], k = rec.spkK || 0, i;
+  for (i = 0; i < k; i++) buttons.push({ label: speakerName(rec, i) + (i === cur ? ' (now)' : ''), value: { a: 'set', i: i } });
+  buttons.push({ label: 'Someone else (new speaker)', value: { a: 'new' } });
+  buttons.push({ label: 'Rename ' + speakerName(rec, cur), value: { a: 'rename', i: cur } });
+  buttons.push({ label: 'Cancel', value: null });
+  var c = await sheet('Who is speaking here?', 'This changes this paragraph only.', buttons);
+  if (!c) return;
+  if (c.a === 'rename'){ await renameSpeaker(rec, c.i); return; }
+  var to = c.a === 'new' ? k : c.i;
+  if (c.a === 'new') rec.spkK = k + 1;
+  objs.forEach(function(o){ o.spk = to; });
+  await DB.putRec(rec);
+  renderSegments(rec);
+}
+async function renameSpeaker(rec, i){
+  var v = prompt('Name for ' + speakerName(rec, i), speakerName(rec, i));
+  if (v && v.trim()){
+    rec.names = rec.names || {};
+    rec.names[i] = v.trim();
+    await DB.putRec(rec);
+    renderSegments(rec);
+  }
+}
+async function speakersMenu(rec){
+  var used = {};
+  rec.segments.forEach(function(sg){ if (sg.t && sg.spk != null) used[sg.spk] = true; });
+  var ids = Object.keys(used).map(Number).sort(function(a, b){ return a - b; });
+  var body = ids.length > 1
+    ? 'Found ' + ids.length + ' voices' + (rec.spkCount ? ' (you set this to ' + rec.spkCount + ').' : '.') + ' If that is wrong, set the number of speakers and Scribe will redo the sorting. Tap a name on any paragraph to fix a single line.'
+    : 'Only one voice was found. If you know there were several, set the number of speakers.';
+  var buttons = [];
+  if (ids.length > 1) buttons.push({ label: 'Rename speakers', value: 'rename' });
+  buttons.push({ label: 'Set the number of speakers', value: 'count' });
+  buttons.push({ label: 'Close', value: null });
+  var c = await sheet('Speakers', body, buttons);
+  if (c === 'rename'){
+    var rb = ids.map(function(i){ return { label: speakerName(rec, i), value: i }; });
+    rb.push({ label: 'Cancel', value: null });
+    var who = await sheet('Rename which speaker?', '', rb);
+    if (who != null) await renameSpeaker(rec, who);
+  } else if (c === 'count'){
+    var cb = [{ label: 'Automatic', value: 0 }];
+    for (var n = 1; n <= 8; n++) cb.push({ label: n + (n === 1 ? ' speaker' : ' speakers'), value: n });
+    cb.push({ label: 'Cancel', value: null });
+    var n2 = await sheet('How many people are speaking?', 'Choosing a number redoes the automatic sorting, so manual changes to who said what are replaced.', cb);
+    if (n2 != null){
+      rec.names = {};
+      labelSpeakers(rec, n2);
+      await DB.putRec(rec);
+      renderDetail(rec);
+    }
+  }
+}
+
+/* recordings made before speaker recognition: work out the voices from the saved audio */
+async function findSpeakers(rec){
+  if (Rec || detailBusy){ toast('Wait for the current job to finish first.'); return; }
+  var blob = await DB.getBlob(rec.id);
+  if (!blob){ toast('The audio for this recording is not stored.'); return; }
+  detailBusy = true;
+  $('dProg').hidden = false; $('dProgFill').style.width = '0%';
+  $('dProgText').textContent = 'Getting the voice model ready';
+  try {
+    var ok = await Engine.ensureVoice();
+    if (!ok) throw new Error('the voice model could not be downloaded. Connect to the internet once and try again.');
+    $('dProgText').textContent = 'Listening to the recording';
+    var pcm = await decodeTo16k(blob);
+    var todo = [];
+    rec.segments.forEach(function(sg){ if (sg.t && !sg.emb) todo.push(sg); });
+    for (var b = 0; b < todo.length; b += 12){
+      var batch = todo.slice(b, b + 12), pieces = [];
+      batch.forEach(function(sg){
+        var a = sg.s, z = Math.max(sg.e, sg.s + 0.5);
+        if (z - a > 6){ var mid = (a + z) / 2; a = mid - 3; z = mid + 3; }
+        pieces.push(pcm.slice(Math.max(0, Math.round(a * RATE)), Math.min(pcm.length, Math.round(z * RATE))));
+      });
+      var res = await Engine.embed(pieces);
+      res.items.forEach(function(it, k){ if (it){ batch[k].emb = it.emb; batch[k].ed = it.ed; } });
+      var f = Math.min(1, (b + 12) / todo.length);
+      $('dProgFill').style.width = Math.round(f * 100) + '%';
+      $('dProgText').textContent = 'Working out who said what: ' + Math.round(f * 100) + '%';
+    }
+    labelSpeakers(rec);
+    await DB.putRec(rec);
+    toast(rec.spkK > 1 ? 'Found ' + rec.spkK + ' speakers.' : 'Only one voice found.');
+  } catch (err){
+    toast('Could not find speakers: ' + friendlyError(err), 7000);
+  }
+  detailBusy = false;
+  $('dProg').hidden = true;
+  if (current && current.id === rec.id) renderDetail(rec);
 }
 $('dSearch').addEventListener('input', function(){ if (current) renderSegments(current); });
 
@@ -770,6 +985,10 @@ $('player').addEventListener('timeupdate', function(){
   var t = this.currentTime, rows = $('dSegs').querySelectorAll('.seg'), hit = null;
   rows.forEach(function(r){ if (t >= parseFloat(r.dataset.s) - 0.1 && t < parseFloat(r.dataset.e) + 0.3) hit = r; });
   rows.forEach(function(r){ r.classList.toggle('active', r === hit); });
+  var cur = null;
+  if (hit) hit.querySelectorAll('.sn').forEach(function(n){ if (t >= parseFloat(n.dataset.s) - 0.1 && t < parseFloat(n.dataset.e) + 0.3) cur = n; });
+  $('dSegs').querySelectorAll('.sn.cur').forEach(function(n){ if (n !== cur) n.classList.remove('cur'); });
+  if (cur) cur.classList.add('cur');
 });
 
 $('dTitle').addEventListener('click', async function(){
@@ -779,22 +998,39 @@ $('dTitle').addEventListener('click', async function(){
 });
 $('backBtn').addEventListener('click', function(){ showView('library'); });
 
+function paraLines(rec){
+  var lab = showSpeakers(rec);
+  return parasOf(rec).map(function(p){
+    return { s: p.s, who: lab ? speakerName(rec, p.spk) : '', text: paraText(rec, p) };
+  }).filter(function(l){ return l.text; });
+}
 function plainText(rec){
-  var out = [rec.title, dateLabel(rec.createdAt) + ', ' + clock(rec.duration), ''];
-  rec.segments.forEach(function(s){ out.push('[' + clock(s.s) + '] ' + s.t); });
-  if ((rec.flags || []).length) out.push('', 'Flagged moments: ' + rec.flags.map(clock).join(', '));
+  var out = [rec.title, dateLabel(rec.createdAt) + ', ' + clock(rec.duration) + (showSpeakers(rec) ? ', ' + rec.spkK + ' speakers' : ''), ''];
+  paraLines(rec).forEach(function(l){ out.push('[' + clock(l.s) + '] ' + (l.who ? l.who + ': ' : '') + l.text, ''); });
+  if ((rec.flags || []).length) out.push('Flagged moments: ' + rec.flags.map(clock).join(', '));
   return out.join('\n');
 }
 function mdText(rec){
   var out = ['# ' + rec.title, '', dateLabel(rec.createdAt) + ', ' + clock(rec.duration), ''];
-  rec.segments.forEach(function(s){ out.push('**' + clock(s.s) + '** ' + s.t, ''); });
+  paraLines(rec).forEach(function(l){
+    out.push(l.who ? '**' + l.who + '** (' + clock(l.s) + ')' : '**' + clock(l.s) + '**', '', l.text, '');
+  });
   if ((rec.flags || []).length) out.push('## Flagged moments', '', rec.flags.map(function(f){ return '- ' + clock(f); }).join('\n'), '');
   return out.join('\n');
 }
 function srtText(rec){
-  return rec.segments.map(function(s, i){
-    return (i + 1) + '\n' + srtTime(s.s) + ' --> ' + srtTime(Math.max(s.e, s.s + 1)) + '\n' + s.t + '\n';
-  }).join('\n');
+  var lab = showSpeakers(rec), n = 0, out = [];
+  parasOf(rec).forEach(function(p){
+    var first = true;
+    p.idx.forEach(function(i){
+      var sg = rec.segments[i];
+      if (!sg.t) return;
+      n++;
+      out.push(n + '\n' + srtTime(sg.s) + ' --> ' + srtTime(Math.max(sg.e, sg.s + 1)) + '\n' + (lab && first ? speakerName(rec, p.spk) + ': ' : '') + sg.t + '\n');
+      first = false;
+    });
+  });
+  return out.join('\n');
 }
 function fileName(rec, ext){ return (rec.title || 'recording').replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-') + '.' + ext; }
 function download(name, text, type){
@@ -813,19 +1049,92 @@ async function copyText(text){
   }
 }
 async function shareRec(rec){
-  var text = plainText(rec);
+  var text = notesView ? notesText(rec) : plainText(rec);
   if (navigator.share){
     try { await navigator.share({ title: rec.title, text: text }); } catch (e) {}
   } else copyText(text);
 }
+
+/* ---------- meeting notes ---------- */
+function notesOf(rec){
+  var labelled = showSpeakers(rec);
+  return Notes.build({
+    items: rec.segments.map(function(x){ return { s: x.s, e: x.e, t: x.t, spk: x.spk }; }),
+    duration: rec.duration, flags: rec.flags || [], labelled: labelled,
+    who: function(i){ return speakerName(rec, i); }
+  });
+}
+function notesMeta(rec){
+  var att = [];
+  if (showSpeakers(rec)) for (var i = 0; i < rec.spkK; i++) att.push(speakerName(rec, i));
+  return { title: rec.title, date: dateLabel(rec.createdAt), duration: rec.duration, attendees: att };
+}
+function notesText(rec){ return Notes.text(notesOf(rec), notesMeta(rec)); }
+function notesMd(rec){ return Notes.markdown(notesOf(rec), notesMeta(rec)); }
+function notesWithTranscript(rec){ return notesMd(rec) + '\n---\n\n' + mdText(rec); }
+function aiPrompt(rec){
+  return 'Please turn the transcript below into clear meeting minutes. Include: a short summary, the main topics, decisions made, action items with owner and deadline where stated, and open questions. Use only what is in the transcript and do not invent anything. Keep the speaker names.\n\n' + plainText(rec);
+}
+function renderNotes(rec){
+  var box = $('dSegs');
+  box.innerHTML = '';
+  var n = notesOf(rec);
+  if (n.empty){ box.appendChild(el('div', 'empty', 'There is not enough speech yet to build notes from.')); return; }
+  function sec(title){ var h = el('h4', 'nh', title); box.appendChild(h); var u = el('ul', 'nl'); box.appendChild(u); return u; }
+  function item(ul, text, t, extra){
+    var li = el('li', '');
+    li.appendChild(document.createTextNode(text));
+    if (extra){ var x = el('span', 'nx', ' ' + extra); li.appendChild(x); }
+    if (t !== undefined){
+      var b = el('button', 'nt', clock(t)); b.addEventListener('click', function(){ seekTo(t); });
+      li.appendChild(document.createTextNode(' ')); li.appendChild(b);
+    }
+    ul.appendChild(li);
+  }
+  var lead = el('p', 'muted small', 'Built on this phone from what was said. Tap a time to hear that moment. The full transcript is one tap away.');
+  box.appendChild(lead);
+  var ul = sec('Summary');
+  n.overview.forEach(function(x){ item(ul, x.text, x.t); });
+  if (n.keywords.length){ var kp = el('p', 'small', 'Key terms: ' + n.keywords.join(', ')); box.appendChild(kp); }
+  if (n.topics.length){ ul = sec('Topics through the conversation'); n.topics.forEach(function(x){ item(ul, x.title + '. ' + x.text, x.t); }); }
+  if (n.decisions.length){ ul = sec('Decisions'); n.decisions.forEach(function(x){ item(ul, x.text, x.t, x.who ? '(' + x.who + ')' : ''); }); }
+  if (n.actions.length){
+    ul = sec('Action items');
+    n.actions.forEach(function(x){
+      item(ul, x.text, x.t, (x.owner ? 'Owner: ' + x.owner + '. ' : (x.said ? '(said by ' + x.said + ') ' : '')) + (x.due ? 'When: ' + x.due + '.' : ''));
+    });
+  }
+  if (n.questions.length){ ul = sec('Questions raised'); n.questions.forEach(function(x){ item(ul, x.text, x.t, x.who ? '(' + x.who + ')' : ''); }); }
+  if (n.figures.length){ ul = sec('Numbers, dates and amounts'); n.figures.forEach(function(x){ item(ul, x.text, x.t); }); }
+  if (n.speakers.length){
+    box.appendChild(el('h4', 'nh', 'By speaker'));
+    n.speakers.forEach(function(s){
+      box.appendChild(el('div', 'who sp' + (s.spk % 6), s.name + ', ' + Math.round(s.share * 100) + '% of talking'));
+      if (s.topics.length) box.appendChild(el('p', 'small muted', 'Talked about: ' + s.topics.join(', ')));
+      var u2 = el('ul', 'nl'); box.appendChild(u2);
+      s.points.forEach(function(p){ item(u2, p.text, p.t); });
+    });
+  }
+  if (n.flagged.length){ ul = sec('Flagged moments'); n.flagged.forEach(function(x){ item(ul, x.text || 'Flagged', x.t); }); }
+  var go = el('button', 'btn', 'Export these notes');
+  go.addEventListener('click', function(){ exportSheet(rec); });
+  box.appendChild(go);
+}
 async function exportSheet(rec){
-  var choice = await sheet('Export transcript', '', [
-    { label: 'Text file (.txt)', value: 'txt' }, { label: 'Markdown (.md)', value: 'md' }, { label: 'Subtitles (.srt)', value: 'srt' },
+  var choice = await sheet('Export', notesView ? 'Notes are a summary. The full transcript is always kept as it is.' : '', [
+    { label: 'Meeting notes (.md)', value: 'nmd', primary: notesView }, { label: 'Meeting notes (.txt)', value: 'ntxt' },
+    { label: 'Notes and full transcript (.md)', value: 'both' },
+    { label: 'Transcript only (.txt)', value: 'txt', primary: !notesView }, { label: 'Transcript only (.md)', value: 'md' }, { label: 'Subtitles (.srt)', value: 'srt' },
+    { label: 'Copy transcript with a minutes request, to paste into an AI chat', value: 'ai' },
     { label: 'Cancel', value: null }
   ]);
   if (choice === 'txt') download(fileName(rec, 'txt'), plainText(rec), 'text/plain');
   if (choice === 'md') download(fileName(rec, 'md'), mdText(rec), 'text/markdown');
   if (choice === 'srt') download(fileName(rec, 'srt'), srtText(rec), 'application/x-subrip');
+  if (choice === 'nmd') download(fileName({ title: rec.title + ' notes' }, 'md'), notesMd(rec), 'text/markdown');
+  if (choice === 'ntxt') download(fileName({ title: rec.title + ' notes' }, 'txt'), notesText(rec), 'text/plain');
+  if (choice === 'both') download(fileName({ title: rec.title + ' notes and transcript' }, 'md'), notesWithTranscript(rec), 'text/markdown');
+  if (choice === 'ai') copyText(aiPrompt(rec));
 }
 async function removeRec(rec){
   var ok = await sheet('Delete this recording?', 'The audio and transcript will be removed from this phone. This cannot be undone.', [{ label: 'Delete', primary: true, value: true }, { label: 'Keep it', value: false }]);
@@ -862,6 +1171,7 @@ function renderSettings(){
     lab.appendChild(inp); lab.appendChild(span); box.appendChild(lab);
   });
   $('keepAudio').checked = Settings.data.keepAudio;
+  $('speakersOpt').checked = Settings.data.speakers;
   $('verInfo').textContent = 'Scribe, ' + APP_VERSION;
   if (navigator.storage && navigator.storage.estimate){
     navigator.storage.estimate().then(function(e){
@@ -871,13 +1181,19 @@ function renderSettings(){
   }
 }
 $('keepAudio').addEventListener('change', function(){ Settings.data.keepAudio = this.checked; Settings.save(); });
+$('speakersOpt').addEventListener('change', function(){ Settings.data.speakers = this.checked; Settings.save(); });
 $('dlModelBtn').addEventListener('click', async function(){
   var key = Settings.data.model;
   if (Engine.isReady(key) || modelReady(key)){
     $('sStatus').textContent = 'Checking the ' + MODELS[key].label + ' model.';
   }
   $('sStatus').textContent = 'Starting the download';
-  try { await Engine.ensure(key); $('sStatus').textContent = MODELS[key].label + ' model is ready and works offline.'; renderSettings(); updateEngineLine(); }
+  try {
+    await Engine.ensure(key);
+    var vOk = Settings.data.speakers ? await Engine.ensureVoice() : true;
+    $('sStatus').textContent = MODELS[key].label + ' model is ready and works offline.' + (Settings.data.speakers ? (vOk ? ' Voice model is ready too.' : ' The voice model could not be downloaded, so speaker names are off until it is.') : '');
+    renderSettings(); updateEngineLine();
+  }
   catch (e){ $('sStatus').textContent = 'Failed: ' + friendlyError(e); }
 });
 $('persistBtn').addEventListener('click', async function(){

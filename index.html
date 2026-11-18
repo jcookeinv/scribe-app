@@ -18,7 +18,8 @@
 :root{
   --bg:#eef1f4; --panel:#ffffff; --ink:#1d2733; --muted:#5f6c7b; --line:#d5dbe2;
   --accent:#0f6e78; --accent-ink:#ffffff; --rec:#d63b3b; --rec-soft:#fbe4e4; --warn:#8a5a00; --warn-bg:#fff3d6;
-  --wave:#0f6e78; --wave-idle:#b9c3ce; --seg-active:#dcedf0;
+  --wave:#0f6e78; --wave-idle:#b9c3ce; --seg-active:#dcedf0; --cur:#bfe0e5;
+  --sp0:#0f6e78; --sp1:#b4530a; --sp2:#6d3fc0; --sp3:#1f7a3d; --sp4:#b3265b; --sp5:#2a64b5;
   --radius:14px; --tab-h:64px;
   --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
@@ -26,7 +27,8 @@
   :root{
     --bg:#151b22; --panel:#1d252e; --ink:#e6ebf0; --muted:#98a5b3; --line:#2c3743;
     --accent:#4cc2cf; --accent-ink:#06262a; --rec:#ef5b5b; --rec-soft:#3a2326; --warn:#f0c36a; --warn-bg:#3a2f17;
-    --wave:#4cc2cf; --wave-idle:#3a4756; --seg-active:#21424a;
+    --wave:#4cc2cf; --wave-idle:#3a4756; --seg-active:#21424a; --cur:#2d5d67;
+    --sp0:#4cc2cf; --sp1:#f0a35e; --sp2:#b79bff; --sp3:#6fd08c; --sp4:#f27aa8; --sp5:#7fb0f5;
   }
 }
 *{box-sizing:border-box}
@@ -60,6 +62,9 @@ canvas#wave{width:100%;height:84px;display:block}
 .bar > i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
 .live{flex:1;min-height:0;overflow-y:auto;border-top:1px solid var(--line);padding:10px 0}
 .line{display:grid;grid-template-columns:52px 1fr;gap:8px;padding:6px 0;line-height:1.45}
+.who{display:block;border:none;background:none;padding:0;margin:0 0 1px;font:inherit;font-size:13px;font-weight:700;text-align:left;color:var(--sp0)}
+button.who{cursor:pointer;min-height:28px}
+.sp0{color:var(--sp0)}.sp1{color:var(--sp1)}.sp2{color:var(--sp2)}.sp3{color:var(--sp3)}.sp4{color:var(--sp4)}.sp5{color:var(--sp5)}
 .line .ts{color:var(--muted);font-variant-numeric:tabular-nums;font-size:13px;padding-top:2px}
 .empty{color:var(--muted);padding:18px 0;line-height:1.5}
 .banner{background:var(--warn-bg);color:var(--warn);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.4;margin:8px 0}
@@ -88,9 +93,16 @@ audio{width:100%;margin:8px 0}
 .chip.danger{color:var(--rec)}
 .seg{display:grid;grid-template-columns:56px 1fr;gap:8px;padding:8px 6px;border-radius:10px;line-height:1.5}
 .seg.active{background:var(--seg-active)}
-.seg .ts{color:var(--accent);font-variant-numeric:tabular-nums;font-size:13px;padding:3px 0;border:none;background:none;text-align:left;cursor:pointer;min-height:32px}
+.sn{cursor:pointer}
+.sn.cur{background:var(--cur);border-radius:4px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+.seg .ts{align-self:start;color:var(--accent);font-variant-numeric:tabular-nums;font-size:13px;padding:3px 0;border:none;background:none;text-align:left;cursor:pointer;min-height:32px}
 .seg .tx[contenteditable="true"]{outline:1px dashed var(--accent);border-radius:6px;padding:2px 4px}
 .seg mark{background:#ffd966;color:#1d2733;border-radius:3px}
+.nh{margin:18px 0 6px;font-size:15px}
+.nl{margin:0 0 6px;padding-left:20px;line-height:1.5}
+.nl li{margin:5px 0}
+.nx{color:var(--muted);font-size:13px}
+.nt{border:none;background:none;color:var(--accent);cursor:pointer;font:inherit;font-size:12px;padding:2px 4px;font-variant-numeric:tabular-nums}
 .flag{display:flex;align-items:center;gap:8px;padding:4px 6px;font-size:13px;color:var(--rec)}
 .flag button{border:none;background:none;color:var(--rec);cursor:pointer;min-height:32px;padding:0;font-size:13px}
 .title-btn{border:none;background:none;text-align:left;padding:0;font-size:22px;font-weight:700;letter-spacing:-0.01em;cursor:pointer;margin:10px 0 2px}
@@ -173,6 +185,7 @@ audio{width:100%;margin:8px 0}
       <div class="muted small" id="sStatus"></div>
 
       <h2>Recordings</h2>
+      <label class="opt"><input type="checkbox" id="speakersOpt"><span><span class="t">Tell speakers apart</span><br><span class="muted small">Labels who is talking, like Speaker 1 and Speaker 2, and keeps one person's sentences together. Uses a small extra model (about 7 MB) that runs on this phone and adds a little processing time. You can rename speakers afterwards.</span></span></label>
       <label class="opt"><input type="checkbox" id="keepAudio"><span><span class="t">Keep the audio</span><br><span class="muted small">Needed for playback and to re-transcribe later. Uses roughly 0.2 to 0.5 MB per minute.</span></span></label>
 
       <h2>Storage and privacy</h2>
@@ -194,6 +207,8 @@ audio{width:100%;margin:8px 0}
 
 <div id="sheetwrap"><div id="sheet" role="dialog" aria-modal="true"></div></div>
 <div id="toast" role="status"></div>
+<script src="speakers.js"></script>
+<script src="notes.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
