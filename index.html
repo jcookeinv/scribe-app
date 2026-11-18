@@ -98,6 +98,7 @@ audio{width:100%;margin:8px 0}
 .seg .ts{align-self:start;color:var(--accent);font-variant-numeric:tabular-nums;font-size:13px;padding:3px 0;border:none;background:none;text-align:left;cursor:pointer;min-height:32px}
 .seg .tx[contenteditable="true"]{outline:1px dashed var(--accent);border-radius:6px;padding:2px 4px}
 .seg mark{background:#ffd966;color:#1d2733;border-radius:3px}
+.vrow{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 4px}
 .nh{margin:18px 0 6px;font-size:15px}
 .nl{margin:0 0 6px;padding-left:20px;line-height:1.5}
 .nl li{margin:5px 0}
@@ -186,6 +187,9 @@ audio{width:100%;margin:8px 0}
 
       <h2>Recordings</h2>
       <label class="opt"><input type="checkbox" id="speakersOpt"><span><span class="t">Tell speakers apart</span><br><span class="muted small">Labels who is talking, like Speaker 1 and Speaker 2, and keeps one person's sentences together. Uses a small extra model (about 7 MB) that runs on this phone and adds a little processing time. You can rename speakers afterwards.</span></span></label>
+      <label class="opt"><input type="checkbox" id="rememberOpt"><span><span class="t">Remember voices I name</span><br><span class="muted small">When you rename a speaker, Scribe keeps that voice (a set of numbers, never the audio) on this phone and names the same person in later recordings. Check the names, it can get one wrong.</span></span></label>
+      <div id="voiceList"></div>
+      <button class="btn" id="forgetVoices">Forget all saved voices</button>
       <label class="opt"><input type="checkbox" id="keepAudio"><span><span class="t">Keep the audio</span><br><span class="muted small">Needed for playback and to re-transcribe later. Uses roughly 0.2 to 0.5 MB per minute.</span></span></label>
 
       <h2>Storage and privacy</h2>

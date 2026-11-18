@@ -297,7 +297,49 @@
     return out;
   }
 
-  var api = { pack: pack, unpack: unpack, cluster: cluster, paragraphs: paragraphs, speechRegions: speechRegions, splitAtPauses: splitAtPauses, MIN_STRONG: MIN_STRONG, DEFAULT_T: DEFAULT_T };
+
+  /* ---- remembered voices ---- */
+  var MATCH_SIM = 0.5;       // a saved voice must be at least this similar to count as the same person
+  var MATCH_MARGIN = 0.08;   // and clearly closer than any other saved voice
+  var MATCH_MIN_SEC = 5;     // too little speech from a voice is not enough to name or save it
+
+  /* One average fingerprint per speaker label, with how many seconds of speech it rests on. */
+  function voiceCentroids(segs){
+    var acc = {};
+    segs.forEach(function(sg){
+      if (!sg.emb || sg.spk == null || (sg.ed || 0) < MIN_STRONG) return;
+      var a = acc[sg.spk] = acc[sg.spk] || { vs: [], ws: [], sec: 0 };
+      a.vs.push(unpack(sg.emb)); a.ws.push(Math.min(sg.ed, 6)); a.sec += Math.min(sg.ed, 6);
+    });
+    var out = {};
+    Object.keys(acc).forEach(function(k){ out[k] = { v: centroid(acc[k].vs, acc[k].ws), sec: acc[k].sec }; });
+    return out;
+  }
+  /* cents: {spk: {v, sec}}, saved: [{id, name, v}]. Returns {spk: {id, name, sim}} for confident matches only. */
+  function matchVoices(cents, saved){
+    var pairs = [], res = {};
+    Object.keys(cents).forEach(function(k){
+      if (cents[k].sec < MATCH_MIN_SEC) return;
+      var sims = saved.map(function(sv){ return dot(cents[k].v, sv.v); });
+      var order = sims.map(function(x, i){ return i; }).sort(function(a, b){ return sims[b] - sims[a]; });
+      if (!order.length) return;
+      var best = sims[order[0]], second = order.length > 1 ? sims[order[1]] : -1;
+      if (best >= MATCH_SIM && best - second >= MATCH_MARGIN) pairs.push({ k: k, i: order[0], sim: best });
+    });
+    pairs.sort(function(a, b){ return b.sim - a.sim; });
+    var usedSaved = {};
+    pairs.forEach(function(p){
+      if (usedSaved[p.i]) return;
+      usedSaved[p.i] = 1;
+      res[p.k] = { id: saved[p.i].id, name: saved[p.i].name, sim: p.sim };
+    });
+    return res;
+  }
+  function blendVoice(oldV, oldSec, newV, newSec){
+    return centroid([oldV, newV], [Math.min(oldSec, 120), Math.min(newSec, 120)]);
+  }
+
+  var api = { voiceCentroids: voiceCentroids, matchVoices: matchVoices, blendVoice: blendVoice, MATCH_MIN_SEC: MATCH_MIN_SEC, pack: pack, unpack: unpack, cluster: cluster, paragraphs: paragraphs, speechRegions: speechRegions, splitAtPauses: splitAtPauses, MIN_STRONG: MIN_STRONG, DEFAULT_T: DEFAULT_T };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Spk = api;
 })(typeof self !== 'undefined' ? self : this);

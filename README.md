@@ -15,6 +15,7 @@ Record meetings on your phone and get a transcript, like Otter, except everythin
 - Re-transcribe a recording with a different model.
 - Tells speakers apart. Sentences are grouped into paragraphs per speaker (Speaker 1, Speaker 2 and so on), live while recording and in the saved transcript. A short pause no longer starts a new line.
 - Tap a name on a paragraph to fix it or rename that speaker. The Speakers button renames everyone or sets the number of speakers if the automatic count is wrong.
+- Remembers voices. When you rename a speaker, Scribe saves that voice (a set of 256 numbers, never audio) on the phone and names the same person automatically in later recordings. Settings lists saved voices and lets you forget one or all of them, or switch this off.
 - Older recordings that kept their audio can be sorted afterwards with Find speakers.
 - Exports include speaker names.
 - Meeting notes: tap Meeting notes on a recording for a minutes-style breakdown (summary, topics through the conversation, decisions, action items with owner and date where said, questions raised, numbers and dates, a section per speaker, flagged moments). The original transcript stays untouched, one tap away on the Transcript button.
@@ -27,6 +28,7 @@ Record meetings on your phone and get a transcript, like Otter, except everythin
 - Phones pause web apps when the screen locks or you switch apps. Keep the screen on while recording. The app asks the phone to stay awake, and warns you if it was in the background.
 - Speaker recognition compares voice fingerprints, so it is good but not perfect. It struggles with noisy rooms, people talking over each other and very short interjections ("yes", "right"). If the count is off, use Speakers, then Set the number of speakers.
 - Meeting notes are built by picking out and sorting sentences that were actually said. They are not rewritten, so they read like extracts rather than polished prose, and can miss or over-pick action items. Check them against the transcript.
+- Automatic naming only happens when a voice clearly matches a saved one, so an unnamed voice stays Speaker N rather than guessing. A different phone, room or heavy background noise lowers the match, and rarely it could name the wrong person, so glance at the names.
 - Speaker changes are placed at sentence and pause boundaries, so a change in the middle of a sentence is not caught.
 - Speaker recognition adds a little processing time. It can be switched off in Settings.
 - English only (the models used are the English ones).
@@ -47,7 +49,7 @@ Record meetings on your phone and get a transcript, like Otter, except everythin
 
 ## Updating later
 
-Upload the changed files the same way. When any app file changes, edit `VERSION` at the top of `sw.js` (currently `scribe-v3`, so use `scribe-v4` next) so phones pick up the new files.
+Upload the changed files the same way. When any app file changes, edit `VERSION` at the top of `sw.js` (currently `scribe-v4`, so use `scribe-v5` next) so phones pick up the new files.
 
 ## Files
 

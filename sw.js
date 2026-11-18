@@ -1,6 +1,6 @@
 // Scribe service worker: caches the app files so it opens and works offline.
 // Bump VERSION whenever any app file changes so phones pick up the new files.
-var VERSION = 'scribe-v3';
+var VERSION = 'scribe-v4';
 var FILES = [
   './', './index.html', './app.js', './worker.js', './pcm-tap.js', './speakers.js', './notes.js', './manifest.webmanifest',
   './icon-192.png', './icon-512.png', './icon-maskable-512.png', './apple-touch-icon.png',

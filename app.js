@@ -1,7 +1,7 @@
 (function(){
 'use strict';
 
-var APP_VERSION = 'scribe-v3';
+var APP_VERSION = 'scribe-v4';
 var RATE = 16000;
 var LIVE_MIN = 12 * RATE;       // live slices are cut at a quiet point between 12 and 18 seconds
 var LIVE_MAX = 18 * RATE;
@@ -85,13 +85,14 @@ function sheet(title, body, buttons){
 
 /* ---------- settings ---------- */
 var Settings = {
-  data: { model: 'base', keepAudio: true, speakers: true },
+  data: { model: 'base', keepAudio: true, speakers: true, remember: true },
   load: function(){
     try {
       var s = JSON.parse(localStorage.getItem('scribe.settings') || '{}');
       if (s.model && MODELS[s.model]) this.data.model = s.model;
       if (typeof s.keepAudio === 'boolean') this.data.keepAudio = s.keepAudio;
       if (typeof s.speakers === 'boolean') this.data.speakers = s.speakers;
+      if (typeof s.remember === 'boolean') this.data.remember = s.remember;
     } catch (e) {}
   },
   save: function(){ try { localStorage.setItem('scribe.settings', JSON.stringify(this.data)); } catch (e) {} }
@@ -470,6 +471,54 @@ function dispatchSlice(final){
   Rec.jobs.push(p);
 }
 
+
+/* ---------- remembered voices ---------- */
+// Saved on this phone only. Each entry is a name and an average voice fingerprint (256 numbers), no audio.
+var Voices = {
+  list: function(){
+    try {
+      var raw = JSON.parse(localStorage.getItem('scribe.voices') || '[]');
+      return raw.filter(function(x){ return x && x.name && x.v && x.v.length; }).map(function(x){ return { id: x.id, name: x.name, v: Spk.unpack(x.v), sec: x.sec || 0 }; });
+    } catch (e){ return []; }
+  },
+  save: function(arr){
+    try {
+      localStorage.setItem('scribe.voices', JSON.stringify(arr.map(function(x){ return { id: x.id, name: x.name, v: Array.prototype.slice.call(Spk.pack(x.v)), sec: Math.round(x.sec) }; })));
+    } catch (e){}
+  },
+  add: function(name, v, sec){
+    var all = this.list(), key = name.toLowerCase(), hit = null;
+    all.forEach(function(x){ if (x.name.toLowerCase() === key) hit = x; });
+    if (hit){ hit.v = Spk.blendVoice(hit.v, hit.sec, v, sec); hit.sec = hit.sec + sec; }
+    else all.push({ id: uid(), name: name, v: v, sec: sec });
+    this.save(all);
+  },
+  remove: function(id){ this.save(this.list().filter(function(x){ return x.id !== id; })); },
+  clear: function(){ try { localStorage.removeItem('scribe.voices'); } catch (e){} }
+};
+// Gives each voice in a recording the name of a saved voice it clearly matches, unless the user already named it.
+function applyVoices(rec){
+  rec.names = rec.names || {};
+  Object.keys(rec.auto || {}).forEach(function(k){ delete rec.names[k]; });
+  rec.auto = {};
+  if (!Settings.data.remember || !hasPrints(rec) || !(rec.spkK > 1 || rec.spkK === 1)) return;
+  var saved = Voices.list();
+  if (!saved.length) return;
+  var m = Spk.matchVoices(Spk.voiceCentroids(rec.segments), saved);
+  Object.keys(m).forEach(function(k){
+    if (rec.names[k]) return;
+    rec.names[k] = m[k].name; rec.auto[k] = true;
+  });
+}
+// Saves the voice behind a speaker so later recordings can name them. Returns true if saved.
+function rememberVoice(rec, i, name){
+  if (!Settings.data.remember) return false;
+  var c = Spk.voiceCentroids(rec.segments)[i];
+  if (!c || c.sec < Spk.MATCH_MIN_SEC) return false;
+  Voices.add(name, c.v, c.sec);
+  return true;
+}
+
 /* ---------- speakers and paragraphs ---------- */
 function speakerName(rec, i){ return (rec.names && rec.names[i]) || ('Speaker ' + (i + 1)); }
 function showSpeakers(rec){ return (rec.spkK || 0) > 1; }
@@ -482,6 +531,7 @@ function labelSpeakers(rec, count){
   var r = Spk.cluster(segs, { count: rec.spkCount || 0 });
   for (var i = 0; i < segs.length; i++) segs[i].spk = r.labels[i];
   rec.spkK = r.k;
+  applyVoices(rec);
 }
 function parasOf(rec){ return Spk.paragraphs(rec.segments, { gap: (rec.spkK || 0) > 0 ? 6 : 2.5 }); }
 function paraText(rec, p){
@@ -894,8 +944,11 @@ async function renameSpeaker(rec, i){
   if (v && v.trim()){
     rec.names = rec.names || {};
     rec.names[i] = v.trim();
+    if (rec.auto) delete rec.auto[i];
+    var saved = rememberVoice(rec, i, v.trim());
     await DB.putRec(rec);
     renderSegments(rec);
+    if (saved) toast('Saved ' + v.trim() + '\'s voice. Scribe will name them in future recordings.', 5000);
   }
 }
 async function speakersMenu(rec){
@@ -921,7 +974,7 @@ async function speakersMenu(rec){
     cb.push({ label: 'Cancel', value: null });
     var n2 = await sheet('How many people are speaking?', 'Choosing a number redoes the automatic sorting, so manual changes to who said what are replaced.', cb);
     if (n2 != null){
-      rec.names = {};
+      rec.names = {}; rec.auto = {};
       labelSpeakers(rec, n2);
       await DB.putRec(rec);
       renderDetail(rec);
@@ -1172,6 +1225,8 @@ function renderSettings(){
   });
   $('keepAudio').checked = Settings.data.keepAudio;
   $('speakersOpt').checked = Settings.data.speakers;
+  $('rememberOpt').checked = Settings.data.remember;
+  renderVoices();
   $('verInfo').textContent = 'Scribe, ' + APP_VERSION;
   if (navigator.storage && navigator.storage.estimate){
     navigator.storage.estimate().then(function(e){
@@ -1181,6 +1236,23 @@ function renderSettings(){
   }
 }
 $('keepAudio').addEventListener('change', function(){ Settings.data.keepAudio = this.checked; Settings.save(); });
+function renderVoices(){
+  var box = $('voiceList'); box.innerHTML = '';
+  var all = Voices.list();
+  if (!all.length){ box.appendChild(el('p', 'muted small', 'No saved voices yet. Rename a speaker in a recording and Scribe will remember that voice.')); return; }
+  all.forEach(function(x){
+    var row = el('div', 'vrow');
+    row.appendChild(el('span', '', x.name));
+    var b = el('button', 'chip', 'Forget'); b.addEventListener('click', function(){ Voices.remove(x.id); renderVoices(); });
+    row.appendChild(b); box.appendChild(row);
+  });
+}
+$('rememberOpt').addEventListener('change', function(){ Settings.data.remember = this.checked; Settings.save(); });
+$('forgetVoices').addEventListener('click', async function(){
+  if (!Voices.list().length){ toast('There are no saved voices.'); return; }
+  var ok = await sheet('Forget all saved voices?', 'Recordings keep the names already on them. New recordings will not be named automatically.', [{ label: 'Forget them all', primary: true, value: true }, { label: 'Cancel', value: false }]);
+  if (ok){ Voices.clear(); renderVoices(); toast('Saved voices removed.'); }
+});
 $('speakersOpt').addEventListener('change', function(){ Settings.data.speakers = this.checked; Settings.save(); });
 $('dlModelBtn').addEventListener('click', async function(){
   var key = Settings.data.model;
